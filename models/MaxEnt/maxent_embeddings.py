@@ -54,7 +54,7 @@ N_BACKGROUND = 10000
 RANDOM_SEED = 42
 
 # Number of spatial CV folds
-N_SPATIAL_FOLDS = 5
+N_SPATIAL_FOLDS = 4
 
 # Test size for standard split
 TEST_SIZE = 0.2
@@ -202,40 +202,52 @@ def fit_maxent(X_presence, X_background, beta_multiplier=1.5):
 # SECTION: Continuous Boyce Index
 #-----------------------------------------------------------
 
-def continuous_boyce_index(pred_presence, pred_background, n_bins=21):
+def continuous_boyce_index(pred_presence, pred_background, window_width=0.1,
+                           step=0.02):
     """
-    Compute the continuous Boyce index (CBI) for a presence-background model.
+    Compute the continuous Boyce index (CBI) using a moving window
+    (Hirzel et al. 2006).
 
-    Measures Spearman rank correlation between predicted suitability bins and
-    the predicted/expected frequency ratio of presence points (Hirzel et al. 2006).
-    A CBI close to 1.0 indicates higher suitability scores consistently predict
-    more presences — the ideal pattern for a well-calibrated SDM.
+    Slides an overlapping window across the predicted suitability gradient
+    and computes the Spearman rank correlation between window centres and
+    the predicted/expected (P/E) frequency ratio.  The moving-window
+    approach is more robust than fixed histogram bins when test presence
+    counts are small, because each point contributes to multiple windows.
+
+    The suitability range is derived from the data (not fixed to 0–1) so
+    bins span the actual prediction distribution.
 
     Args:
         pred_presence (numpy.ndarray): Model predictions at presence locations.
         pred_background (numpy.ndarray): Model predictions at background locations.
-        n_bins (int): Number of bins to partition the suitability gradient.
+        window_width (float): Width of each moving window in suitability units.
+        step (float): Step size between successive window centres.
 
     Returns:
         float: Spearman correlation coefficient (CBI), range [-1, 1].
     """
-    bins = np.linspace(0, 1, n_bins)
+    all_preds = np.concatenate([pred_presence, pred_background])
+    p_min, p_max = all_preds.min(), all_preds.max()
 
-    F_pres = np.histogram(pred_presence, bins=bins)[0].astype(float)
-    F_pres /= len(pred_presence)
+    # Slide overlapping windows across the suitability gradient
+    centers = np.arange(p_min + window_width / 2,
+                        p_max - window_width / 2 + step, step)
+    pe_ratios = []
 
-    # Expected frequency from background only (Hirzel et al. 2006):
-    # background represents available environment, not presence + background
-    F_all = np.histogram(pred_background, bins=bins)[0].astype(float)
-    F_all /= len(pred_background)
+    for c in centers:
+        lo, hi = c - window_width / 2, c + window_width / 2
+        n_pres = np.sum((pred_presence >= lo) & (pred_presence < hi))
+        n_bg = np.sum((pred_background >= lo) & (pred_background < hi))
+        if n_bg == 0:
+            continue
+        F_pres = n_pres / len(pred_presence)
+        F_exp = n_bg / len(pred_background)
+        pe_ratios.append(F_pres / F_exp)
 
-    # Only use bins with observations to avoid division by zero
-    valid = F_all > 0
-    if valid.sum() < 3:
+    if len(pe_ratios) < 3:
         return np.nan
 
-    pe_ratio = F_pres[valid] / F_all[valid]
-    return spearmanr(np.arange(valid.sum()), pe_ratio).correlation
+    return spearmanr(np.arange(len(pe_ratios)), pe_ratios).correlation
 
 
 #-----------------------------------------------------------
