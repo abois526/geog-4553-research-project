@@ -7,6 +7,14 @@ Uses elapid for MaxEnt implementation and its built-in utilities for
 background sampling, raster annotation, spatial cross-validation, and
 raster prediction.
 
+Preprocessing:
+  - Pixel deduplication: removes presence points that fall in the same
+    raster pixel (identical covariate values at 10m resolution).
+  - PCA: reduces 64 correlated embedding bands to N_PCA_COMPONENTS
+    uncorrelated principal components before modeling (Merow et al. 2013,
+    Section III.B). The fitted PCA is embedded in the saved model so
+    prediction can be applied directly to the original 64-band raster.
+
 Evaluation: standard train/test split + spatial block cross-validation.
 Metrics: AUC-ROC and continuous Boyce index (CBI).
 Extracted raster values are cached to CACHE_DIR on first run to skip re-extraction.
@@ -17,6 +25,7 @@ import geopandas as gpd
 import rasterio
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score
+from sklearn.decomposition import PCA
 from scipy.stats import spearmanr
 from pathlib import Path
 import argparse
@@ -24,9 +33,18 @@ import joblib
 import elapid
 import warnings
 
-# Suppress known nuisance warnings; keep convergence/CRS warnings visible
+# Suppress known nuisance warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning, message=".*palette.*")
+warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*invalid value.*")
+warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*divide by zero.*")
+# 'unitialized' is a typo in the warning, this is intential
+warnings.filterwarnings("ignore", category=UserWarning, message=".*where.*unitialized memory.*")
+
+
+# Ensure convergence warnings are always visible
+from sklearn.exceptions import ConvergenceWarning
+warnings.filterwarnings("always", category=ConvergenceWarning)
 
 try:
     import glmnet  # noqa: F401
@@ -54,7 +72,7 @@ N_BACKGROUND = 10000
 RANDOM_SEED = 42
 
 # Number of spatial CV folds
-N_SPATIAL_FOLDS = 4
+N_SPATIAL_FOLDS = 5
 
 # Test size for standard split
 TEST_SIZE = 0.2
@@ -65,8 +83,13 @@ CACHE_DIR = r"/Users/andrew/Workspace/github-repos/geog-4553-research-project/mo
 # Path to save/load the fitted final model (required for predict mode)
 MODEL_PATH = r"/Users/andrew/Workspace/github-repos/geog-4553-research-project/models/MaxEnt/data/outputs/maxent_model.joblib"  # e.g., r"C:\path\to\maxent_model.joblib"
 
-# Regularization multiplier grid for tuning (Merow et al. 2013)
-BETA_GRID = [0.5, 1.0, 1.5, 2.0, 3.0, 5.0]
+# Regularization multiplier grid for tuning (Merow et al. 2013, Section III.C)
+BETA_GRID = [0.5, 1.0, 1.5, 2.0, 3.0, 5.0, 8.0, 10.0, 15.0]
+
+# Number of PCA components to reduce embedding bands to before modeling.
+# Reduces correlated 64-band embeddings to uncorrelated components
+# (Merow et al. 2013, Section III.B recommends PCA for correlated predictors).
+N_PCA_COMPONENTS = 15
 
 
 #-----------------------------------------------------------
@@ -137,6 +160,46 @@ def load_presence_points(shp_path, raster_path):
 
 
 #-----------------------------------------------------------
+# SECTION: Pixel Deduplication
+#-----------------------------------------------------------
+
+def deduplicate_to_unique_pixels(gdf, raster_path):
+    """
+    Remove presence points that fall in the same raster pixel.
+
+    At 10m resolution, multiple GPS waypoints often land in the same pixel
+    and would extract identical covariate values — effectively
+    pseudoreplicating that environment in the model. This keeps one point
+    per unique pixel.
+
+    Args:
+        gdf (GeoDataFrame): Presence points.
+        raster_path (str): Path to the raster (used to get the pixel grid).
+
+    Returns:
+        GeoDataFrame: Deduplicated presence points (one per unique pixel).
+    """
+    n_before = len(gdf)
+
+    with rasterio.open(raster_path) as src:
+        coords = np.array([(g.x, g.y) for g in gdf.geometry])
+        rows, cols = rasterio.transform.rowcol(src.transform, coords[:, 0], coords[:, 1])
+
+    # Build a pixel identifier and keep first occurrence
+    pixel_ids = list(zip(rows, cols))
+    gdf = gdf.copy()
+    gdf["_pixel_id"] = pixel_ids
+    gdf = gdf.drop_duplicates(subset="_pixel_id", keep="first").drop(columns="_pixel_id")
+
+    n_after = len(gdf)
+    n_removed = n_before - n_after
+    print(f"  Pixel deduplication: {n_before} points → {n_after} unique pixels "
+          f"({n_removed} duplicates removed)")
+
+    return gdf
+
+
+#-----------------------------------------------------------
 # SECTION: Extract Band Values from Annotated GeoDataFrame
 #-----------------------------------------------------------
 
@@ -164,7 +227,8 @@ def get_band_values(annotated_gdf):
 # SECTION: Fit MaxEnt Model
 #-----------------------------------------------------------
 
-def fit_maxent(X_presence, X_background, beta_multiplier=1.5):
+def fit_maxent(X_presence, X_background, beta_multiplier=1.5, seed=RANDOM_SEED,
+               preprocessor=None):
     """
     Fit a MaxEnt model using elapid.
 
@@ -177,13 +241,20 @@ def fit_maxent(X_presence, X_background, beta_multiplier=1.5):
         X_presence (numpy.ndarray): Shape (n_presence, n_features).
         X_background (numpy.ndarray): Shape (n_background, n_features).
         beta_multiplier (float): Regularization multiplier (higher = simpler model).
+        seed (int): Random seed for model reproducibility.
+        preprocessor: Optional sklearn transformer (e.g. fitted PCA) to embed
+            in the model. elapid applies it automatically during predict().
 
     Returns:
-        elapid.MaxentModel: Fitted model.
+        elapid.MaxentModel: Fitted model (with preprocessor attached if provided).
     """
     model = elapid.MaxentModel(
         feature_types=["linear", "quadratic", "hinge"],
         beta_multiplier=beta_multiplier,
+        random_state=seed,
+        # pbr=100: presence weight=1, background weight=100
+        # (maxnet default for Poisson point process approximation)
+        class_weights=100.0,
     )
 
     # elapid expects: x = feature array, y = labels (1=presence, 0=background)
@@ -193,7 +264,7 @@ def fit_maxent(X_presence, X_background, beta_multiplier=1.5):
         np.zeros(len(X_background)),
     ])
 
-    model.fit(X, y)
+    model.fit(X, y, preprocessor=preprocessor)
     print(f"MaxEnt model fitted (beta={beta_multiplier})")
     return model
 
@@ -232,6 +303,7 @@ def continuous_boyce_index(pred_presence, pred_background, window_width=0.1,
     # Slide overlapping windows across the suitability gradient
     centers = np.arange(p_min + window_width / 2,
                         p_max - window_width / 2 + step, step)
+    pe_centers = []
     pe_ratios = []
 
     for c in centers:
@@ -242,12 +314,13 @@ def continuous_boyce_index(pred_presence, pred_background, window_width=0.1,
             continue
         F_pres = n_pres / len(pred_presence)
         F_exp = n_bg / len(pred_background)
+        pe_centers.append(c)
         pe_ratios.append(F_pres / F_exp)
 
     if len(pe_ratios) < 3:
         return np.nan
 
-    return spearmanr(np.arange(len(pe_ratios)), pe_ratios).correlation
+    return spearmanr(pe_centers, pe_ratios).correlation
 
 
 #-----------------------------------------------------------
@@ -287,7 +360,7 @@ def evaluate_standard_split(X_presence, X_background, test_size=0.2, seed=42,
         X_background, test_size=test_size, random_state=seed
     )
 
-    model = fit_maxent(Xp_train, Xb_train, beta_multiplier=beta_multiplier)
+    model = fit_maxent(Xp_train, Xb_train, beta_multiplier=beta_multiplier, seed=seed)
 
     X_test = np.vstack([Xp_test, Xb_test])
     y_test = np.concatenate([np.ones(len(Xp_test)), np.zeros(len(Xb_test))])
@@ -301,6 +374,66 @@ def evaluate_standard_split(X_presence, X_background, test_size=0.2, seed=42,
     print(f"  Boyce index: {cbi:.4f}")
 
     return model, auc, cbi
+
+
+def _build_stratified_spatial_folds(presence_gdf, background_gdf, n_presence,
+                                    n_background, n_folds, seed):
+    """
+    Build spatial CV folds stratified by presence points.
+
+    Clusters presence points geographically into *n_folds* groups using
+    elapid.GeographicKFold, then assigns each background point to the fold
+    whose presence-cluster centroid is nearest.  This guarantees every fold
+    contains presence points, avoiding the empty-fold problem that occurs
+    when geographic blocking is driven by the much larger background set.
+
+    Args:
+        presence_gdf (GeoDataFrame): Presence point geometries.
+        background_gdf (GeoDataFrame): Background point geometries.
+        n_presence (int): Number of presence samples.
+        n_background (int): Number of background samples.
+        n_folds (int): Number of spatial folds.
+        seed (int): Random seed.
+
+    Returns:
+        list[tuple[ndarray, ndarray]]: (train_indices, test_indices) per fold,
+            indexed into the concatenated [presence | background] array.
+    """
+    from scipy.spatial import cKDTree
+
+    # 1. Assign presence points to folds via geographic clustering
+    gkf = elapid.GeographicKFold(n_splits=n_folds, random_state=seed)
+    presence_fold_labels = np.full(n_presence, -1, dtype=int)
+    for fold, (_, test_idx) in enumerate(gkf.split(presence_gdf)):
+        presence_fold_labels[test_idx] = fold
+
+    # 2. Compute centroid of each fold's presence cluster
+    presence_coords = np.array(
+        [(g.x, g.y) for g in presence_gdf.geometry]
+    )
+    bg_coords = np.array(
+        [(g.x, g.y) for g in background_gdf.geometry]
+    )
+
+    centroids = np.array([
+        presence_coords[presence_fold_labels == f].mean(axis=0)
+        for f in range(n_folds)
+    ])
+
+    # 3. Assign each background point to nearest fold centroid
+    tree = cKDTree(centroids)
+    _, bg_fold_labels = tree.query(bg_coords)
+
+    # 4. Build combined indices (presence first, then background offset)
+    all_fold_labels = np.concatenate([presence_fold_labels, bg_fold_labels])
+    folds = []
+    for f in range(n_folds):
+        test_mask = all_fold_labels == f
+        train_idx = np.where(~test_mask)[0]
+        test_idx = np.where(test_mask)[0]
+        folds.append((train_idx, test_idx))
+
+    return folds
 
 
 #-----------------------------------------------------------
@@ -337,21 +470,23 @@ def evaluate_spatial_cv(X_presence, X_background, presence_gdf, background_gdf,
     print(f"EVALUATION: Spatial Block Cross-Validation ({n_folds} folds)")
     print("=" * 60)
 
-    # Combine presence and background for geographic splitting
-    all_geom = presence_gdf.geometry.tolist() + background_gdf.geometry.tolist()
-    all_gdf = gpd.GeoDataFrame(geometry=all_geom, crs=presence_gdf.crs)
+    # Build folds stratified by presence geography to ensure every fold
+    # contains presence points (avoids background-density-dominated clustering)
+    folds = _build_stratified_spatial_folds(
+        presence_gdf, background_gdf,
+        n_presence=len(X_presence), n_background=len(X_background),
+        n_folds=n_folds, seed=seed,
+    )
 
     X_all = np.vstack([X_presence, X_background])
     y_all = np.concatenate([np.ones(len(X_presence)), np.zeros(len(X_background))])
     n_bands = X_all.shape[1]
 
-    gkf = elapid.GeographicKFold(n_splits=n_folds, random_state=seed)
-
     fold_aucs = []
     fold_cbis = []
     fold_importances = []
 
-    for fold, (train_idx, test_idx) in enumerate(gkf.split(all_gdf)):
+    for fold, (train_idx, test_idx) in enumerate(folds):
         X_train, X_test = X_all[train_idx], X_all[test_idx]
         y_train, y_test = y_all[train_idx], y_all[test_idx]
 
@@ -361,12 +496,14 @@ def evaluate_spatial_cv(X_presence, X_background, presence_gdf, background_gdf,
         if n_test_presence == 0:
             print(f"  Fold {fold + 1}: skipped (no test presence points)")
             continue
+        if n_test_presence < 5:
+            print(f"  WARNING: Fold {fold + 1} has only {n_test_presence} test presence point(s) — metrics unreliable")
 
         # Separate presence/background in training set for MaxEnt fitting
         Xp_train = X_train[y_train == 1]
         Xb_train = X_train[y_train == 0]
 
-        model = fit_maxent(Xp_train, Xb_train, beta_multiplier=beta_multiplier)
+        model = fit_maxent(Xp_train, Xb_train, beta_multiplier=beta_multiplier, seed=seed)
 
         y_pred = model.predict(X_test)
         auc = roc_auc_score(y_test, y_pred)
@@ -430,14 +567,15 @@ def tune_beta(X_presence, X_background, presence_gdf, background_gdf,
     print("=" * 60)
 
     # Pre-compute geographic folds once so all betas use the same splits
-    all_geom = presence_gdf.geometry.tolist() + background_gdf.geometry.tolist()
-    all_gdf = gpd.GeoDataFrame(geometry=all_geom, crs=presence_gdf.crs)
+    # Folds are stratified by presence geography (see _build_stratified_spatial_folds)
+    folds = _build_stratified_spatial_folds(
+        presence_gdf, background_gdf,
+        n_presence=len(X_presence), n_background=len(X_background),
+        n_folds=n_folds, seed=seed,
+    )
 
     X_all = np.vstack([X_presence, X_background])
     y_all = np.concatenate([np.ones(len(X_presence)), np.zeros(len(X_background))])
-
-    gkf = elapid.GeographicKFold(n_splits=n_folds, random_state=seed)
-    folds = list(gkf.split(all_gdf))
 
     best_beta = beta_grid[0]
     best_mean_auc = -1.0
@@ -449,13 +587,16 @@ def tune_beta(X_presence, X_background, presence_gdf, background_gdf,
             X_train, X_test = X_all[train_idx], X_all[test_idx]
             y_train, y_test = y_all[train_idx], y_all[test_idx]
 
-            if (y_test == 1).sum() == 0:
+            n_test_p = int((y_test == 1).sum())
+            if n_test_p == 0:
                 continue
+            if n_test_p < 5:
+                print(f"  WARNING: Fold has only {n_test_p} test presence point(s) — AUC unreliable")
 
             Xp_train = X_train[y_train == 1]
             Xb_train = X_train[y_train == 0]
 
-            model = fit_maxent(Xp_train, Xb_train, beta_multiplier=beta)
+            model = fit_maxent(Xp_train, Xb_train, beta_multiplier=beta, seed=seed)
             auc = roc_auc_score(y_test, model.predict(X_test))
             fold_aucs.append(auc)
 
@@ -513,16 +654,16 @@ def permutation_importance(model, X_test, y_test, n_repeats=10, seed=42):
 
 def print_importance(importances, top_n=10):
     """
-    Print the top-N most important bands by mean AUC drop.
+    Print the top-N most important features by mean AUC drop.
 
     Args:
-        importances (numpy.ndarray): Mean importance per band, shape (n_features,).
-        top_n (int): Number of top bands to display.
+        importances (numpy.ndarray): Mean importance per feature, shape (n_features,).
+        top_n (int): Number of top features to display.
     """
-    print("\n  Permutation Importance (top bands by AUC drop, held-out data):")
+    print("\n  Permutation Importance (top features by AUC drop, held-out data):")
     ranked = np.argsort(importances)[::-1]
-    for rank, band_idx in enumerate(ranked[:top_n]):
-        print(f"    {rank + 1}. Band {band_idx}: {importances[band_idx]:.4f}")
+    for rank, idx in enumerate(ranked[:top_n]):
+        print(f"    {rank + 1}. PC{idx + 1:02d}: {importances[idx]:.4f}")
 
 
 #-----------------------------------------------------------
@@ -552,18 +693,22 @@ def save_extraction_cache(cache_dir, presence_annotated, background_annotated):
     print(f"  Cache saved to: {cache_path}")
 
 
-def load_extraction_cache(cache_dir):
+def load_extraction_cache(cache_dir, source_paths=None):
     """
-    Load annotated GeoDataFrames from disk if available.
+    Load annotated GeoDataFrames from disk if available and fresh.
 
-    Returns None if cache_dir is falsy or any expected file is missing.
+    Returns None if cache_dir is falsy, any expected file is missing, or the
+    cache is older than the source inputs (stale).
 
     Args:
         cache_dir (str): Directory to look for cache files.
+        source_paths (list[str] | None): Paths to source files (e.g. shapefile,
+            raster) used to generate the cache.  If provided, the cache is
+            invalidated when any source file is newer than the cache.
 
     Returns:
         tuple or None: (presence_annotated, background_annotated)
-            if all cache files exist, otherwise None.
+            if all cache files exist and are fresh, otherwise None.
     """
     if not cache_dir:
         return None
@@ -576,6 +721,16 @@ def load_extraction_cache(cache_dir):
 
     if not all(f.exists() for f in expected_files):
         return None
+
+    # Invalidate cache if source inputs have been modified since cache creation
+    if source_paths:
+        cache_mtime = min(f.stat().st_mtime for f in expected_files)
+        src_mtime = max(
+            Path(p).stat().st_mtime for p in source_paths if Path(p).exists()
+        )
+        if cache_mtime < src_mtime:
+            print("  Cache is stale (inputs modified after cache creation). Re-extracting...")
+            return None
 
     print(f"  Loading cached extraction from: {cache_path}")
     presence = gpd.read_file(expected_files[0])
@@ -643,17 +798,21 @@ def run_fit():
     validate_paths(PRESENCE_SHP=PRESENCE_SHP, RASTER_STACK=RASTER_STACK)
 
     # --- Load from cache or run full extraction ---
-    cached = load_extraction_cache(CACHE_DIR)
+    cached = load_extraction_cache(CACHE_DIR, source_paths=[PRESENCE_SHP, RASTER_STACK])
 
     if cached is not None:
         presence_annotated, background_annotated = cached
-        X_presence = get_band_values(presence_annotated)
-        X_background = get_band_values(background_annotated)
-        print(f"  Presence samples:   {X_presence.shape}")
-        print(f"  Background samples: {X_background.shape}")
+        X_presence_raw = get_band_values(presence_annotated)
+        X_background_raw = get_band_values(background_annotated)
+        print(f"  Presence samples:   {X_presence_raw.shape}")
+        print(f"  Background samples: {X_background_raw.shape}")
     else:
         print("Loading presence points...")
         presence_gdf = load_presence_points(PRESENCE_SHP, RASTER_STACK)
+
+        # Deduplicate: keep one point per unique raster pixel
+        print("\nDeduplicating presence points to unique raster pixels...")
+        presence_gdf = deduplicate_to_unique_pixels(presence_gdf, RASTER_STACK)
 
         print("\nGenerating background points...")
         np.random.seed(RANDOM_SEED)  # seed before elapid call for reproducibility
@@ -664,7 +823,7 @@ def run_fit():
         presence_annotated = elapid.annotate(
             presence_gdf.geometry, [RASTER_STACK], drop_na=True
         )
-        print(f"  Presence samples: {len(presence_annotated)}")
+        print(f"  Presence samples after annotation: {len(presence_annotated)}")
 
         print("Extracting raster values at background locations...")
         background_annotated = elapid.annotate(
@@ -674,10 +833,33 @@ def run_fit():
 
         save_extraction_cache(CACHE_DIR, presence_annotated, background_annotated)
 
-        X_presence = get_band_values(presence_annotated)
-        X_background = get_band_values(background_annotated)
+        X_presence_raw = get_band_values(presence_annotated)
+        X_background_raw = get_band_values(background_annotated)
 
-    validate_arrays(X_presence=X_presence, X_background=X_background)
+    validate_arrays(X_presence=X_presence_raw, X_background=X_background_raw)
+
+    # --- PCA dimensionality reduction ---
+    # Reduces correlated 64-band embeddings to uncorrelated principal components.
+    # Merow et al. (2013, Section III.B) recommends PCA for correlated predictors.
+    print("\n" + "=" * 60)
+    print(f"PCA: Reducing {X_presence_raw.shape[1]} bands to {N_PCA_COMPONENTS} components")
+    print("=" * 60)
+
+    # Fit PCA on the full dataset (presence + background) so it captures the
+    # landscape's environmental variation. The fitted PCA is then passed into
+    # elapid as a preprocessor so it is automatically applied during predict()
+    # and apply_model_to_rasters().
+    pca = PCA(n_components=N_PCA_COMPONENTS, random_state=RANDOM_SEED)
+    X_all_raw = np.vstack([X_presence_raw, X_background_raw])
+    pca.fit(X_all_raw)
+
+    X_presence = pca.transform(X_presence_raw)
+    X_background = pca.transform(X_background_raw)
+
+    explained = pca.explained_variance_ratio_.sum() * 100
+    print(f"  Variance explained: {explained:.1f}%")
+    print(f"  Presence shape:     {X_presence.shape}")
+    print(f"  Background shape:   {X_background.shape}")
 
     # --- Regularization tuning ---
     best_beta = tune_beta(
@@ -698,10 +880,19 @@ def run_fit():
     )
 
     # --- Fit final model on ALL data ---
+    # Fit on PCA-transformed data (no preprocessor), then attach PCA manually.
+    # We can't pass preprocessor to fit() because elapid's fit() internally
+    # calls predict() on already-transformed data, which double-applies the
+    # preprocessor and crashes. Attaching afterward means predict() and
+    # apply_model_to_rasters() will apply PCA to raw 64-band input correctly.
     print("\n" + "=" * 60)
     print("Fitting final model on all data...")
     print("=" * 60)
-    final_model = fit_maxent(X_presence, X_background, beta_multiplier=best_beta)
+    final_model = fit_maxent(
+        X_presence, X_background,
+        beta_multiplier=best_beta, seed=RANDOM_SEED,
+    )
+    final_model.preprocessor = pca
     save_model(final_model, MODEL_PATH)
 
     # --- Variable importance (from spatial CV held-out folds) ---
@@ -716,7 +907,7 @@ def run_fit():
     print("=" * 60)
     print(f"  Presence points used:  {len(X_presence)}")
     print(f"  Background points:     {len(X_background)}")
-    print(f"  Predictor bands:       {X_presence.shape[1]}")
+    print(f"  PCA components:        {N_PCA_COMPONENTS} ({explained:.1f}% variance explained)")
     print(f"  Beta multiplier:       {best_beta}")
     print(f"  Standard split AUC:    {std_auc:.4f}")
     print(f"  Standard split CBI:    {std_cbi:.4f}")
