@@ -3,3 +3,6 @@
 
 # python stuff
 .venv
+docs/
+__pycache__/
+data/
