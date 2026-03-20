@@ -941,25 +941,95 @@ def run_predict():
     print(f"Suitability raster written to: {OUTPUT_RASTER}")
 
 
+def run_export_folds():
+    """
+    Export spatial CV fold assignments as shapefiles for visualization.
+
+    Loads presence and background points from cache, recomputes fold
+    assignments using the same seed and parameters as run_fit(), and
+    writes one shapefile per fold plus a combined shapefile with all
+    points labeled by fold number.
+
+    Output directory: data/outputs/folds/
+    """
+    cached = load_extraction_cache(CACHE_DIR, source_paths=[PRESENCE_SHP, RASTER_STACK])
+    if cached is None:
+        raise RuntimeError(
+            "No cached extraction found. Run 'fit' mode first to generate the cache."
+        )
+
+    presence_annotated, background_annotated = cached
+    print(f"  Presence samples:   {len(presence_annotated)}")
+    print(f"  Background samples: {len(background_annotated)}")
+
+    folds = _build_stratified_spatial_folds(
+        presence_annotated, background_annotated,
+        n_presence=len(presence_annotated),
+        n_background=len(background_annotated),
+        n_folds=N_SPATIAL_FOLDS, seed=RANDOM_SEED,
+    )
+
+    n_presence = len(presence_annotated)
+    out_dir = Path(CACHE_DIR).parent / "folds"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build a combined GeoDataFrame with fold and type labels
+    all_gdf = gpd.GeoDataFrame(
+        {"geometry": list(presence_annotated.geometry) + list(background_annotated.geometry)},
+        crs=presence_annotated.crs,
+    )
+    all_gdf["fold"] = -1
+    all_gdf["point_type"] = ["presence"] * n_presence + ["background"] * len(background_annotated)
+
+    for fold_idx, (_, test_idx) in enumerate(folds):
+        all_gdf.loc[test_idx, "fold"] = fold_idx + 1  # 1-indexed for readability
+
+    # Export per-fold shapefiles (presence points only for cleaner visualization)
+    for fold_num in range(1, N_SPATIAL_FOLDS + 1):
+        fold_presence = all_gdf[
+            (all_gdf["fold"] == fold_num) & (all_gdf["point_type"] == "presence")
+        ][["geometry", "fold"]].copy()
+
+        fold_path = out_dir / f"fold_{fold_num}_presence.shp"
+        fold_presence.to_file(fold_path)
+        print(f"  Fold {fold_num}: {len(fold_presence)} presence points → {fold_path}")
+
+    # Export combined file with all points
+    combined_path = out_dir / "all_folds_presence.shp"
+    all_presence = all_gdf[all_gdf["point_type"] == "presence"][["geometry", "fold"]].copy()
+    all_presence.to_file(combined_path)
+    print(f"\n  Combined presence folds → {combined_path}")
+
+    # Also export background folds for reference
+    combined_bg_path = out_dir / "all_folds_background.shp"
+    all_bg = all_gdf[all_gdf["point_type"] == "background"][["geometry", "fold"]].copy()
+    all_bg.to_file(combined_bg_path)
+    print(f"  Combined background folds → {combined_bg_path}")
+
+    print(f"\nAll fold shapefiles written to: {out_dir}")
+
+
 def main():
     """
     Entry point. Parses the mode argument and dispatches to the appropriate workflow.
 
     Modes:
-        fit     — extract features (cached), evaluate, fit final model, save to disk
-        predict — load saved model, write suitability raster
-        all     — run fit then predict
+        fit         — extract features (cached), evaluate, fit final model, save to disk
+        predict     — load saved model, write suitability raster
+        all         — run fit then predict
+        exportfolds — export spatial CV fold assignments as shapefiles
     """
     parser = argparse.ArgumentParser(
         description="MaxEnt habitat suitability model — Bromus tectorum, MD Ranchland No. 66"
     )
     parser.add_argument(
         "mode",
-        choices=["fit", "predict", "all"],
+        choices=["fit", "predict", "all", "exportfolds"],
         help=(
             "fit: evaluate and fit the model; "
             "predict: generate suitability raster from saved model; "
-            "all: fit then predict"
+            "all: fit then predict; "
+            "exportfolds: export spatial CV fold assignments as shapefiles"
         ),
     )
     args = parser.parse_args()
@@ -968,6 +1038,8 @@ def main():
         run_fit()
     elif args.mode == "predict":
         run_predict()
+    elif args.mode == "exportfolds":
+        run_export_folds()
     else:  # all
         run_fit()
         run_predict()
