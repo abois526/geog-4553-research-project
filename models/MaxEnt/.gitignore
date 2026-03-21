@@ -1,0 +1,10 @@
+# for MaxEnt model
+# environment and paths
+docs/
+data/inputs/
+data/outputs/cache/
+data/outputs/folds/
+
+# file types
+*.joblib
+*.tif
