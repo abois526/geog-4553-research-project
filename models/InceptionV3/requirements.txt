@@ -1,0 +1,16 @@
+# geospatial processing
+rasterio
+rioxarray
+geopandas
+matplotlib
+shapely
+
+# inception v3
+torch
+torchvision
+
+# visualization
+numpy<2.0
+pandas
+matplotlib
+scikit-learn
