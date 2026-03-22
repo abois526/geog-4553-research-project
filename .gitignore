@@ -6,3 +6,12 @@ emb_stack/emb11Nclp.tif
 data/emb11Nclp.tif
 
 __pycache__/
+
+data
+
+probability_map.tif
+probability_map.png
+best_model.pt
+scaler.joblib
+scratch.py
+scratch2.py
