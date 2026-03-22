@@ -1,7 +1,8 @@
+# For general use throughout the project, including all models and data processing scripts
 .vscode/*
 .DS_Store
-
-# python stuff
 .venv
 emb_stack/emb11Nclp.tif
 data/emb11Nclp.tif
+
+__pycache__/
