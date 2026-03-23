@@ -23,6 +23,10 @@ Extracted raster values are cached to CACHE_DIR on first run to skip re-extracti
 import numpy as np
 import geopandas as gpd
 import rasterio
+import matplotlib.colors as mcolors
+import matplotlib.pyplot as plt
+from matplotlib_scalebar.scalebar import ScaleBar
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score
 from sklearn.decomposition import PCA
@@ -90,6 +94,10 @@ BETA_GRID = [0.5, 1.0, 1.5, 2.0, 3.0, 5.0, 8.0, 10.0, 15.0]
 # Reduces correlated 64-band embeddings to uncorrelated components
 # (Merow et al. 2013, Section III.B recommends PCA for correlated predictors).
 N_PCA_COMPONENTS = 15
+
+# Output paths for the poster-quality suitability map
+OUTPUT_MAP_PNG = r"/Users/andrew/Workspace/github-repos/geog-4553-research-project/models/MaxEnt/data/outputs/maxent_suitability_map.png"
+OUTPUT_MAP_SVG = r"/Users/andrew/Workspace/github-repos/geog-4553-research-project/models/MaxEnt/data/outputs/maxent_suitability_map.svg"
 
 
 #-----------------------------------------------------------
@@ -1009,6 +1017,228 @@ def run_export_folds():
     print(f"\nAll fold shapefiles written to: {out_dir}")
 
 
+# ---------------------------------------------------------------------------
+# Poster-quality suitability map
+# ---------------------------------------------------------------------------
+
+def make_maxent_map(tif_path: str,
+                    out_png: str,
+                    out_svg: str = None,
+                    title: str = "Habitat Suitability — Bromus tectorum\nMD Ranchland No. 66, Alberta",
+                    shp_path: str = None,
+                    raster_path: str = None):
+    """
+    Renders a poster-quality MaxEnt suitability heatmap from the prediction
+    GeoTIFF with standard cartographic elements (title, scalebar, north arrow,
+    easting/northing axes, colorbar).
+
+    Optionally overlays deduplicated presence points from the shapefile.
+    Deduplication uses the raster pixel grid to remove points that fall in
+    the same 10m cell.
+
+    Args:
+        tif_path:    Path to the suitability GeoTIFF (single-band, values 0–1).
+        out_png:     Output path for the PNG map.
+        out_svg:     Output path for the SVG map (vector, optional).
+        title:       Map title (supports newlines).
+        shp_path:    Path to the presence points shapefile. If provided,
+                     deduplicated presence points are overlaid on the map.
+        raster_path: Path to the 64-band raster stack (used for pixel
+                     deduplication of presence points). Required if shp_path
+                     is provided.
+    """
+    import matplotlib as mpl
+    mpl.rcParams.update({
+        "font.family":      "sans-serif",
+        "font.sans-serif":  ["Helvetica", "Arial", "DejaVu Sans"],
+        "axes.spines.top":  False,
+        "axes.spines.right": False,
+        "text.antialiased":  True,
+        "savefig.dpi":       300,
+    })
+
+    with rasterio.open(tif_path) as src:
+        suit = src.read(1).astype(np.float32)
+        meta = src.meta.copy()
+        nodata = src.nodata
+
+    if nodata is not None:
+        suit[suit == nodata] = np.nan
+
+    # Continuous blue → yellow → orange colormap
+    cmap = mcolors.LinearSegmentedColormap.from_list(
+        "maxent_suit",
+        [(0.0, "#2166ac"),
+         (0.25, "#67a9cf"),
+         (0.5, "#f7e76d"),
+         (0.75, "#f5a623"),
+         (1.0, "#e65100")],
+    )
+    cmap.set_bad(color="#1a1a1a")
+
+    # Compute spatial extent from raster transform
+    transform = meta["transform"]
+    left   = transform.c
+    top    = transform.f
+    right  = left + transform.a * meta["width"]
+    bottom = top  + transform.e * meta["height"]
+    extent = [left, right, bottom, top]
+
+    fig, ax = plt.subplots(figsize=(14, 11), dpi=200)
+    fig.patch.set_facecolor("#1a1a1a")
+    ax.set_facecolor("#1a1a1a")
+
+    im = ax.imshow(
+        suit,
+        cmap=cmap,
+        vmin=0, vmax=1,
+        extent=extent,
+        interpolation="bilinear",
+        aspect="equal",
+    )
+
+    # Overlay deduplicated presence points
+    if shp_path:
+        gdf = gpd.read_file(shp_path)
+        if gdf.crs is None:
+            gdf = gdf.set_crs(epsg=3857)
+        gdf = gdf.to_crs(epsg=26911)
+
+        # Deduplicate to unique raster pixels (same logic as training pipeline)
+        if raster_path:
+            gdf = deduplicate_to_unique_pixels(gdf, raster_path)
+
+        ax.scatter(gdf.geometry.x, gdf.geometry.y,
+                   c="#ffe600", s=14, marker="o", linewidths=0.5,
+                   edgecolors="black", alpha=0.9,
+                   label=f"Presence ({len(gdf)} pts, deduplicated)", zorder=5)
+        ax.legend(loc="lower left", framealpha=0.3,
+                  labelcolor="white", fontsize=9,
+                  facecolor="#333333", edgecolor="#555555")
+
+    # Extend axis limits slightly beyond the raster to add padding
+    y_pad = (extent[3] - extent[2]) * 0.02
+    x_pad = (extent[1] - extent[0]) * 0.02
+    ax.set_xlim(extent[0] - x_pad, extent[1] + x_pad)
+    ax.set_ylim(extent[2] - y_pad, extent[3] + y_pad)
+
+    # Colorbar
+    divider = make_axes_locatable(ax)
+    cax = divider.append_axes("right", size="3%", pad=0.12)
+    cb  = fig.colorbar(im, cax=cax)
+    cb.set_label("Habitat Suitability", color="white", fontsize=11, labelpad=10)
+    cb.ax.yaxis.set_tick_params(color="white")
+    cb.outline.set_edgecolor("white")
+    plt.setp(cb.ax.yaxis.get_ticklabels(), color="white", fontsize=9)
+    cb.set_ticks([0, 0.25, 0.5, 0.75, 1.0])
+    cb.set_ticklabels(["0%", "25%", "50%", "75%", "100%"])
+
+    # Axis labels — Easting / Northing with full metre values
+    import matplotlib.ticker as mticker
+    ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{int(x):,}"))
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{int(x):,}"))
+    ax.set_xlabel("Easting (m)", color="white", fontsize=10)
+    ax.set_ylabel("Northing (m)", color="white", fontsize=10)
+    ax.tick_params(colors="white", labelsize=8)
+    for spine in ax.spines.values():
+        spine.set_edgecolor("white")
+
+    # Scalebar — CRS is EPSG:26911 (metres), fixed at 20 km with ticks at 0, 5, 10, 20
+    scalebar = ScaleBar(
+        dx=1, units="m", location="lower right",
+        fixed_value=20, fixed_units="km",
+        scale_formatter=lambda value, unit: "",
+        color="white", box_alpha=0.3,
+        font_properties={"size": 9},
+        scale_loc="top",
+        border_pad=0.8,
+        sep=3,
+    )
+    ax.add_artist(scalebar)
+
+    # Add tick labels at 0, 5, 10, 20 km along the scalebar
+    # Use actual axis width (accounts for padding) to position labels
+    ax_xlim = ax.get_xlim()
+    ax_width = ax_xlim[1] - ax_xlim[0]
+    bar_20km_frac = 20000 / ax_width  # fraction of axes width that 20 km spans
+    # ScaleBar "lower right" anchors right edge ~2% from right
+    bar_right = 0.98
+    bar_left  = bar_right - bar_20km_frac
+    for km in [0, 5, 10, 20]:
+        x_pos = bar_left + (km / 20) * bar_20km_frac
+        ax.text(x_pos, 0.045, f"{km} km" if km == 20 else str(km),
+                transform=ax.transAxes, ha="center", va="bottom",
+                color="white", fontsize=8, zorder=10)
+
+    # North arrow — classic two-tone chevron with "N" label
+    from matplotlib.patches import Polygon
+    # Centre and size in axes-fraction coordinates
+    cx, cy = 0.90, 0.14   # centre of the arrow base
+    w, h   = 0.0125, 0.03  # half-width and height of the chevron
+
+    # Left half (white fill)
+    left_tri = Polygon(
+        [(cx, cy + h), (cx - w, cy - h * 0.3), (cx, cy)],
+        closed=True, facecolor="white", edgecolor="white",
+        linewidth=0.8, transform=ax.transAxes, zorder=10,
+    )
+    # Right half (dark fill)
+    right_tri = Polygon(
+        [(cx, cy + h), (cx + w, cy - h * 0.3), (cx, cy)],
+        closed=True, facecolor="#888888", edgecolor="white",
+        linewidth=0.8, transform=ax.transAxes, zorder=10,
+    )
+    ax.add_patch(left_tri)
+    ax.add_patch(right_tri)
+
+    # "N" label beneath the chevron
+    ax.text(cx, cy - h * 0.3 - 0.015, "N",
+            transform=ax.transAxes, ha="center", va="top",
+            color="white", fontsize=12, fontweight="bold", zorder=10)
+
+    # Title
+    ax.set_title(title, color="white", fontsize=16, fontweight="bold",
+                 pad=18, loc="left")
+
+    # Subtitle — aligned with title, nudged slightly right
+    ax.text(0.02, 1.005, "MaxEnt  ·  64-band embeddings (PCA)  ·  Habitat suitability",
+            transform=ax.transAxes, color="white", fontsize=9, style="italic",
+            ha="left", va="bottom")
+
+    # CRS note
+    fig.text(0.15, 0.015,
+             "CRS: NAD83 / UTM Zone 11N (EPSG:26911)  ·  Resolution: 10 m",
+             color="white", fontsize=7, style="italic")
+
+    plt.tight_layout(pad=1.5, rect=[0, 0.02, 0.97, 0.97])
+    plt.savefig(out_png, dpi=300, bbox_inches="tight",
+                facecolor=fig.get_facecolor())
+    print(f"  PNG saved → {out_png}")
+
+    if out_svg:
+        plt.savefig(out_svg, bbox_inches="tight",
+                    facecolor=fig.get_facecolor())
+        print(f"  SVG saved → {out_svg}")
+
+    plt.close()
+
+
+def run_create_map():
+    """Load the suitability raster and render a poster-quality map with
+    deduplicated presence points overlaid."""
+    validate_paths(OUTPUT_RASTER=OUTPUT_RASTER, PRESENCE_SHP=PRESENCE_SHP,
+                   RASTER_STACK=RASTER_STACK)
+    print("\n── Creating suitability map ──")
+    make_maxent_map(
+        tif_path=OUTPUT_RASTER,
+        out_png=OUTPUT_MAP_PNG,
+        out_svg=OUTPUT_MAP_SVG,
+        shp_path=PRESENCE_SHP,
+        raster_path=RASTER_STACK,
+    )
+    print("  Done.\n")
+
+
 def main():
     """
     Entry point. Parses the mode argument and dispatches to the appropriate workflow.
@@ -1018,18 +1248,20 @@ def main():
         predict     — load saved model, write suitability raster
         all         — run fit then predict
         exportfolds — export spatial CV fold assignments as shapefiles
+        createmap   — render a poster-quality suitability map from the prediction raster
     """
     parser = argparse.ArgumentParser(
         description="MaxEnt habitat suitability model — Bromus tectorum, MD Ranchland No. 66"
     )
     parser.add_argument(
         "mode",
-        choices=["fit", "predict", "all", "exportfolds"],
+        choices=["fit", "predict", "all", "exportfolds", "createmap"],
         help=(
             "fit: evaluate and fit the model; "
             "predict: generate suitability raster from saved model; "
             "all: fit then predict; "
-            "exportfolds: export spatial CV fold assignments as shapefiles"
+            "exportfolds: export spatial CV fold assignments as shapefiles; "
+            "createmap: render poster-quality suitability map from prediction raster"
         ),
     )
     args = parser.parse_args()
@@ -1040,6 +1272,8 @@ def main():
         run_predict()
     elif args.mode == "exportfolds":
         run_export_folds()
+    elif args.mode == "createmap":
+        run_create_map()
     else:  # all
         run_fit()
         run_predict()
