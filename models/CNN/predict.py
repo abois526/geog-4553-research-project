@@ -24,7 +24,7 @@ import numpy as np
 import rasterio
 import torch
 from matplotlib.patches import Patch
-from matplotlib_scalebar.scalebar import ScaleBar
+# from matplotlib_scalebar.scalebar import ScaleBar
 from model import get_model
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from rasterio.transform import from_bounds
@@ -139,7 +139,7 @@ def make_poster_heatmap(prob_map: np.ndarray,
          (0.3, "#e8d5a3"),
          (0.6, "#c97b2f"),
          (0.8, "#8b2500"),
-         (1.0, "#3d0000")],
+         (1.0, "#550000")],
     )
 
     # Compute spatial extent from raster transform
@@ -173,10 +173,10 @@ def make_poster_heatmap(prob_map: np.ndarray,
         presence = gdf[gdf["label"] == 1]
         absence  = gdf[gdf["label"] == 0]
         ax.scatter(presence.geometry.x, presence.geometry.y,
-                   c="#00e5ff", s=12, marker="^", linewidths=0.4,
+                   c="#E300E3", s=12, marker="^", linewidths=0.4,
                    edgecolors="white", alpha=0.85, label="Presence", zorder=5)
         ax.scatter(absence.geometry.x,  absence.geometry.y,
-                   c="#ffffff", s=8,  marker="o", linewidths=0.3,
+                   c="#002ae8", s=8,  marker="o", linewidths=0.3,
                    edgecolors="#aaaaaa", alpha=0.5, label="Absence",  zorder=5)
         ax.legend(loc="lower left", framealpha=0.3,
                   labelcolor="white", fontsize=9,
