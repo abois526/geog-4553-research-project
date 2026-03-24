@@ -4,6 +4,7 @@ docs/
 data/inputs/
 data/outputs/cache/
 data/outputs/folds/
+data/outputs/maps/
 
 # file types
 *.joblib

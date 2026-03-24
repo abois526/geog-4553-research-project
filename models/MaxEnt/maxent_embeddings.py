@@ -32,6 +32,7 @@ from sklearn.metrics import roc_auc_score
 from sklearn.decomposition import PCA
 from scipy.stats import spearmanr
 from pathlib import Path
+import os
 import argparse
 import joblib
 import elapid
@@ -96,8 +97,8 @@ BETA_GRID = [0.5, 1.0, 1.5, 2.0, 3.0, 5.0, 8.0, 10.0, 15.0]
 N_PCA_COMPONENTS = 15
 
 # Output paths for the poster-quality suitability map
-OUTPUT_MAP_PNG = r"/Users/andrew/Workspace/github-repos/geog-4553-research-project/models/MaxEnt/data/outputs/maxent_suitability_map.png"
-OUTPUT_MAP_SVG = r"/Users/andrew/Workspace/github-repos/geog-4553-research-project/models/MaxEnt/data/outputs/maxent_suitability_map.svg"
+OUTPUT_MAP_PNG = r"/Users/andrew/Workspace/github-repos/geog-4553-research-project/models/MaxEnt/data/outputs/maps/maxent_suitability_map.png"
+OUTPUT_MAP_SVG = r"/Users/andrew/Workspace/github-repos/geog-4553-research-project/models/MaxEnt/data/outputs/maps/maxent_suitability_map.svg"
 
 
 #-----------------------------------------------------------
@@ -945,6 +946,7 @@ def run_predict():
     model = load_model(MODEL_PATH)
 
     print("\nGenerating suitability raster...")
+    Path(OUTPUT_RASTER).parent.mkdir(parents=True, exist_ok=True)
     elapid.apply_model_to_rasters(model, [RASTER_STACK], OUTPUT_RASTER)
     print(f"Suitability raster written to: {OUTPUT_RASTER}")
 
@@ -1024,7 +1026,7 @@ def run_export_folds():
 def make_maxent_map(tif_path: str,
                     out_png: str,
                     out_svg: str = None,
-                    title: str = "Habitat Suitability — Bromus tectorum\nMD Ranchland No. 66, Alberta",
+                    title: str = "Habitat Suitability — Bromus tectorum\nMunicipal District of Ranchland No. 66, Alberta",
                     shp_path: str = None,
                     raster_path: str = None):
     """
@@ -1201,23 +1203,52 @@ def make_maxent_map(tif_path: str,
                  pad=18, loc="left")
 
     # Subtitle — aligned with title, nudged slightly right
-    ax.text(0.02, 1.005, "MaxEnt  ·  64-band embeddings (PCA)  ·  Habitat suitability",
+    ax.text(0.02, 1.005, "Method: MaxEnt  ·  CRS: NAD83 / UTM Zone 11N (EPSG:26911)  ·  Resolution: 10m",
             transform=ax.transAxes, color="white", fontsize=9, style="italic",
             ha="left", va="bottom")
 
-    # CRS note
-    fig.text(0.15, 0.015,
-             "CRS: NAD83 / UTM Zone 11N (EPSG:26911)  ·  Resolution: 10 m",
-             color="white", fontsize=7, style="italic")
+    # ── Inset locator map (Alberta with study area) ──────────────────────
+    from pyproj import Transformer
+    from matplotlib.patches import Rectangle
 
-    plt.tight_layout(pad=1.5, rect=[0, 0.02, 0.97, 0.97])
+    # Place inset in the lower-right blank area, near the north arrow
+    inset_ax = ax.inset_axes([0.66, 0.05, 0.14, 0.24])  # [x, y, w, h] in axes fraction
+    inset_ax.set_facecolor("#1a1a1a")
+    for sp in inset_ax.spines.values():
+        sp.set_visible(False)
+
+    # Load Alberta province boundary from Natural Earth (provinces)
+    ne_url = ("https://naciscdn.org/naturalearth/10m/cultural/"
+              "ne_10m_admin_1_states_provinces.zip")
+    provinces = gpd.read_file(ne_url)
+    alberta = provinces[provinces["name"] == "Alberta"]
+    alberta.plot(ax=inset_ax, facecolor="#3a3a3a", edgecolor="white",
+                 linewidth=0.5)
+
+    # Study area polygon from the MD boundary shapefile
+    md_bound = gpd.read_file(
+        os.path.join(os.path.dirname(__file__),
+                     "data", "inputs", "extras", "MD_bound_zipped_11N.shp"))
+    md_bound_4326 = md_bound.to_crs(epsg=4326)
+    md_bound_4326.plot(ax=inset_ax, facecolor="#ff4444", edgecolor="#ff4444",
+                       alpha=0.55, linewidth=0.8, zorder=5)
+
+    inset_ax.set_xlim(-121, -109)
+    inset_ax.set_ylim(48.5, 60.5)
+    inset_ax.set_xticks([])
+    inset_ax.set_yticks([])
+    inset_ax.set_title("Alberta", color="white", fontsize=10, pad=3)
+
+    plt.tight_layout(pad=1.5, rect=[0.03, 0.03, 0.97, 0.97])
+    Path(out_png).parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_png, dpi=300, bbox_inches="tight",
-                facecolor=fig.get_facecolor())
+                pad_inches=0.3, facecolor=fig.get_facecolor())
     print(f"  PNG saved → {out_png}")
 
     if out_svg:
+        Path(out_svg).parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(out_svg, bbox_inches="tight",
-                    facecolor=fig.get_facecolor())
+                    pad_inches=0.3, facecolor=fig.get_facecolor())
         print(f"  SVG saved → {out_svg}")
 
     plt.close()
