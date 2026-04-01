@@ -40,8 +40,8 @@ from tqdm import tqdm
 # Constants — paths for createmap mode
 # ---------------------------------------------------------------------------
 
-PROBABILITY_TIF = os.path.join(os.path.dirname(__file__), "probability_map.tif")
-POINTS_SHP      = os.path.join(os.path.dirname(__file__), "points_combined.shp")
+PROBABILITY_TIF = r"C:\Users\esigf646\repos\geog-4553-research-project\probability_map.tif"
+POINTS_SHP      = r"C:\Users\esigf646\repos\geog-4553-research-project\data\points_thinned.shp"
 RASTER_STACK    = r"/Users/andrew/Workspace/github-repos/geog-4553-research-project/models/MaxEnt/data/inputs/emb11Nclp.tif"
 OUTPUT_MAP_PNG  = os.path.join(os.path.dirname(__file__), "cnn_suitability_map.png")
 OUTPUT_MAP_SVG  = os.path.join(os.path.dirname(__file__), "cnn_suitability_map.svg")
@@ -432,9 +432,7 @@ def make_cnn_map(tif_path: str,
                  linewidth=0.5)
 
     # Study area polygon from the MD boundary shapefile
-    md_bound = gpd.read_file(
-        os.path.join(os.path.dirname(__file__),
-                     "..", "MaxEnt", "data", "inputs", "extras", "MD_bound_zipped_11N.shp"))
+    md_bound = gpd.read_file(r"data\MD_bound_zipped_11N.shp")
     md_bound_4326 = md_bound.to_crs(epsg=4326)
     md_bound_4326.plot(ax=inset_ax, facecolor="#ff4444", edgecolor="#ff4444",
                        alpha=0.55, linewidth=0.8, zorder=5)
