@@ -1,5 +1,5 @@
 # For general use throughout the project, including all models and data processing scripts
-.vscode/*
+.vscode/
 .DS_Store
 .venv
 emb_stack/emb11Nclp.tif
@@ -15,3 +15,4 @@ best_model.pt
 scaler.joblib
 scratch.py
 scratch2.py
+cull_points.py
