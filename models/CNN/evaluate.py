@@ -1,14 +1,16 @@
 """
 evaluate.py  —  Downy Brome SDM
-5-fold stratified cross-validation to check for overfitting.
-Reports mean ± std AUC across folds, plus train vs val AUC per fold.
+Spatial block cross-validation to check for overfitting.
+Uses KMeans geographic blocking (matching MaxEnt evaluation approach) rather
+than random stratified folds to account for spatial autocorrelation in presence data.
+Reports mean ± std AUC and CBI across folds, plus train vs val AUC per fold.
 
 Usage
 -----
 python evaluate.py \
-    --shp  data/points_combined.shp \
-    --tif  data/emb11Nclp.tif       \
-    --label_col label                \
+    --shp  data/points_combined_culled.shp \
+    --tif  data/emb11Nclp.tif             \
+    --label_col label                      \
     --folds 5
 """
 
@@ -17,15 +19,115 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from sklearn.model_selection import StratifiedKFold
+from sklearn.cluster import KMeans
 from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import StandardScaler
+from scipy.stats import spearmanr
 from torch.utils.data import DataLoader, WeightedRandomSampler
 import matplotlib.pyplot as plt
 import matplotlib as mpl
+import geopandas as gpd
+import rasterio
 
-from data import sample_raster_at_points, SpectraDataset
+from data import SpectraDataset
 from model import get_model
+
+
+# ---------------------------------------------------------------------------
+# Spatial block fold builder
+# Mirrors MaxEnt's _build_stratified_spatial_folds: cluster presence points
+# geographically, assign absence/background points to nearest centroid.
+# ---------------------------------------------------------------------------
+
+def build_spatial_folds(coords, y, n_folds=5, random_state=42):
+    """
+    Build spatial CV folds stratified by presence point geography.
+
+    Clusters presence points into n_folds geographic blocks via KMeans,
+    then assigns absence points to the nearest block centroid. This prevents
+    nearby points from appearing in both train and test sets, avoiding
+    AUC inflation from spatial autocorrelation.
+
+    Args:
+        coords (np.ndarray): Shape (N, 2) — (x, y) coordinates per point.
+        y (np.ndarray): Shape (N,) — binary labels (1=presence, 0=absence).
+        n_folds (int): Number of spatial folds.
+        random_state (int): Random seed.
+
+    Yields:
+        tuple[np.ndarray, np.ndarray]: (train_indices, val_indices) per fold.
+    """
+    presence_idx = np.where(y == 1)[0]
+    absence_idx  = np.where(y == 0)[0]
+
+    presence_coords = coords[presence_idx]
+    absence_coords  = coords[absence_idx]
+
+    # 1. Cluster presence points geographically
+    km = KMeans(n_clusters=n_folds, random_state=random_state, n_init=10)
+    presence_fold_labels = km.fit_predict(presence_coords)
+
+    # 2. Assign absence points to nearest presence cluster centroid
+    centroids = km.cluster_centers_
+    dists = np.linalg.norm(absence_coords[:, None] - centroids[None], axis=2)
+    absence_fold_labels = np.argmin(dists, axis=1)
+
+    # 3. Build combined label array aligned to original indices
+    fold_labels = np.empty(len(y), dtype=int)
+    fold_labels[presence_idx] = presence_fold_labels
+    fold_labels[absence_idx]  = absence_fold_labels
+
+    for fold in range(n_folds):
+        val_idx   = np.where(fold_labels == fold)[0]
+        train_idx = np.where(fold_labels != fold)[0]
+        yield train_idx, val_idx
+
+
+# ---------------------------------------------------------------------------
+# Continuous Boyce Index
+# Ported from MaxEnt implementation (Hirzel et al. 2006).
+# ---------------------------------------------------------------------------
+
+def continuous_boyce_index(pred_presence, pred_absence, window_width=0.1, step=0.02):
+    """
+    Compute the Continuous Boyce Index (CBI) using a moving window.
+
+    Slides an overlapping window across the predicted suitability range and
+    computes the Spearman correlation between window centres and the
+    predicted/expected frequency ratio. Positive values mean high suitability
+    areas contain more presences than expected by chance.
+
+    Args:
+        pred_presence (np.ndarray): Model predictions at presence locations.
+        pred_absence (np.ndarray): Model predictions at absence locations.
+        window_width (float): Width of each moving window in suitability units.
+        step (float): Step size between successive window centres.
+
+    Returns:
+        float: Spearman correlation (CBI), range [-1, 1]. NaN if insufficient data.
+    """
+    all_preds = np.concatenate([pred_presence, pred_absence])
+    p_min, p_max = all_preds.min(), all_preds.max()
+
+    centers   = np.arange(p_min + window_width / 2, p_max - window_width / 2 + step, step)
+    pe_centers = []
+    pe_ratios  = []
+
+    for c in centers:
+        lo, hi = c - window_width / 2, c + window_width / 2
+        n_pres = np.sum((pred_presence >= lo) & (pred_presence < hi))
+        n_abs  = np.sum((pred_absence  >= lo) & (pred_absence  < hi))
+        if n_abs == 0:
+            continue
+        F_pres = n_pres / len(pred_presence)
+        F_exp  = n_abs  / len(pred_absence)
+        pe_centers.append(c)
+        pe_ratios.append(F_pres / F_exp)
+
+    if len(pe_ratios) < 3:
+        return np.nan
+
+    return spearmanr(pe_centers, pe_ratios).correlation
 
 
 # ---------------------------------------------------------------------------
@@ -35,12 +137,10 @@ from model import get_model
 def run_fold(X_tr, y_tr, X_val, y_val, n_bands, device,
              epochs=100, batch_size=64, patience=20, lr=1e-3):
 
-    # Normalise within fold (fit on train only)
-    scaler   = StandardScaler()
-    X_tr     = scaler.fit_transform(X_tr).astype(np.float32)
-    X_val    = scaler.transform(X_val).astype(np.float32)
+    scaler = StandardScaler()
+    X_tr   = scaler.fit_transform(X_tr).astype(np.float32)
+    X_val  = scaler.transform(X_val).astype(np.float32)
 
-    # Dataloaders
     train_ds = SpectraDataset(X_tr, y_tr)
     val_ds   = SpectraDataset(X_val, y_val)
 
@@ -59,14 +159,12 @@ def run_fold(X_tr, y_tr, X_val, y_val, n_bands, device,
     )
 
     best_val_auc   = 0.0
-    best_state     = None
+    best_preds_val = None
     patience_count = 0
-
-    train_aucs = []
-    val_aucs   = []
+    train_aucs     = []
+    val_aucs       = []
 
     for epoch in range(1, epochs + 1):
-        # --- Train ---
         model.train()
         for X, y in train_loader:
             X, y = X.to(device), y.to(device).unsqueeze(1)
@@ -75,7 +173,6 @@ def run_fold(X_tr, y_tr, X_val, y_val, n_bands, device,
             loss.backward()
             optimizer.step()
 
-        # --- Evaluate ---
         model.eval()
         with torch.no_grad():
             def get_preds(loader):
@@ -83,22 +180,21 @@ def run_fold(X_tr, y_tr, X_val, y_val, n_bands, device,
                 for X, y in loader:
                     all_p.append(model(X.to(device)).cpu().numpy())
                     all_y.append(y.numpy())
-                return np.concatenate(all_p), np.concatenate(all_y)
+                return np.concatenate(all_p).squeeze(), np.concatenate(all_y)
 
             tr_preds, tr_labels = get_preds(train_loader)
             vl_preds, vl_labels = get_preds(val_loader)
 
         tr_auc = roc_auc_score(tr_labels, tr_preds)
         vl_auc = roc_auc_score(vl_labels, vl_preds)
-
         train_aucs.append(tr_auc)
         val_aucs.append(vl_auc)
 
         scheduler.step(vl_auc)
 
         if vl_auc > best_val_auc:
-            best_val_auc = vl_auc
-            best_state   = {k: v.clone() for k, v in model.state_dict().items()}
+            best_val_auc   = vl_auc
+            best_preds_val = (vl_preds.copy(), vl_labels.copy())
             patience_count = 0
         else:
             patience_count += 1
@@ -106,7 +202,7 @@ def run_fold(X_tr, y_tr, X_val, y_val, n_bands, device,
         if patience_count >= patience:
             break
 
-    return best_val_auc, train_aucs, val_aucs
+    return best_val_auc, best_preds_val, train_aucs, val_aucs
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +234,7 @@ def plot_fold_curves(all_train_aucs, all_val_aucs, out_path="cv_curves.png"):
             ax.legend(fontsize=8, labelcolor="white",
                       facecolor="#333333", edgecolor="#555555")
 
-    fig.suptitle("Train vs Validation AUC — 5-Fold Cross Validation\nDowny Brome SDM",
+    fig.suptitle("Train vs Validation AUC — Spatial Block Cross-Validation\nDowny Brome SDM",
                  color="white", fontsize=13, fontweight="bold", y=1.02)
     plt.tight_layout()
     plt.savefig(out_path, dpi=150, bbox_inches="tight",
@@ -153,55 +249,100 @@ def plot_fold_curves(all_train_aucs, all_val_aucs, out_path="cv_curves.png"):
 
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"\n{'='*50}")
-    print(f"  Downy Brome SDM  —  {args.folds}-fold CV on {device}")
-    print(f"{'='*50}\n")
+    print(f"\n{'='*60}")
+    print(f"  Downy Brome SDM  —  {args.folds}-fold Spatial Block CV on {device}")
+    print(f"{'='*60}\n")
 
-    X, y = sample_raster_at_points(args.shp, args.tif, args.label_col)
-    n_bands = X.shape[1]
+    # Load points and extract raster values + coordinates
+    gdf = gpd.read_file(args.shp)
+    if gdf.crs is None:
+        gdf = gdf.set_crs(epsg=26911)
 
-    skf = StratifiedKFold(n_splits=args.folds, shuffle=True, random_state=42)
+    with rasterio.open(args.tif) as src:
+        if gdf.crs != src.crs:
+            gdf = gdf.to_crs(src.crs)
+        coords_xy = np.array([(geom.x, geom.y) for geom in gdf.geometry])
+        samples   = list(src.sample([(x, y) for x, y in coords_xy]))
+        nodata    = src.nodata if src.nodata is not None else -9999
+
+    X = np.array(samples, dtype=np.float32)
+    y = gdf[args.label_col].values.astype(np.int64)
+
+    # Drop nodata rows, keeping coords aligned
+    valid    = ~np.any(X == nodata, axis=1)
+    X        = X[valid]
+    y        = y[valid]
+    coords   = coords_xy[valid]
+    n_bands  = X.shape[1]
+
+    print(f"  Sampled {len(X)} valid points  "
+          f"({y.sum()} presence / {(y==0).sum()} absence)\n")
 
     fold_aucs      = []
+    fold_cbis      = []
     all_train_aucs = []
     all_val_aucs   = []
 
-    for fold, (tr_idx, vl_idx) in enumerate(skf.split(X, y), 1):
-        print(f"  Fold {fold}/{args.folds} ", end="", flush=True)
+    for fold, (tr_idx, vl_idx) in enumerate(
+            build_spatial_folds(coords, y, n_folds=args.folds), 1):
+
         X_tr, X_val = X[tr_idx], X[vl_idx]
         y_tr, y_val = y[tr_idx], y[vl_idx]
 
-        best_auc, tr_aucs, vl_aucs = run_fold(
+        n_val_p = int((y_val == 1).sum())
+        if n_val_p == 0:
+            print(f"  Fold {fold}/{args.folds} → skipped (no presence points in val block)")
+            continue
+        if n_val_p < 5:
+            print(f"  WARNING: Fold {fold} has only {n_val_p} val presence point(s) — metrics unreliable")
+
+        print(f"  Fold {fold}/{args.folds}  "
+              f"(train: {(y_tr==1).sum()}p/{(y_tr==0).sum()}a  "
+              f"val: {(y_val==1).sum()}p/{(y_val==0).sum()}a) ", end="", flush=True)
+
+        best_auc, best_preds, tr_aucs, vl_aucs = run_fold(
             X_tr, y_tr, X_val, y_val, n_bands, device,
             epochs=args.epochs, patience=args.patience
         )
 
+        # CBI on best-epoch val predictions
+        vl_preds, vl_labels = best_preds
+        cbi = continuous_boyce_index(
+            vl_preds[vl_labels == 1],
+            vl_preds[vl_labels == 0],
+        )
+
         fold_aucs.append(best_auc)
+        fold_cbis.append(cbi)
         all_train_aucs.append(tr_aucs)
         all_val_aucs.append(vl_aucs)
 
         gap = tr_aucs[np.argmax(vl_aucs)] - best_auc
-        print(f"→  Val AUC: {best_auc:.4f}  |  Train-Val gap: {gap:+.4f}")
+        cbi_str = f"{cbi:.4f}" if not np.isnan(cbi) else "  nan"
+        print(f"→  Val AUC: {best_auc:.4f}  |  CBI: {cbi_str}  |  Train-Val gap: {gap:+.4f}")
 
     mean_auc = np.mean(fold_aucs)
     std_auc  = np.std(fold_aucs)
+    mean_cbi = np.nanmean(fold_cbis)
+    std_cbi  = np.nanstd(fold_cbis)
 
-    print(f"\n{'='*50}")
-    print(f"  Mean Val AUC : {mean_auc:.4f}")
-    print(f"  Std  Val AUC : {std_auc:.4f}")
-    print(f"  Per-fold     : {[f'{a:.4f}' for a in fold_aucs]}")
-    print(f"{'='*50}\n")
+    print(f"\n{'='*60}")
+    print(f"  Mean Val AUC : {mean_auc:.4f} ± {std_auc:.4f}")
+    print(f"  Mean CBI     : {mean_cbi:.4f} ± {std_cbi:.4f}")
+    print(f"  Per-fold AUC : {[f'{a:.4f}' for a in fold_aucs]}")
+    print(f"  Per-fold CBI : {[f'{c:.4f}' if not np.isnan(c) else 'nan' for c in fold_cbis]}")
+    print(f"{'='*60}\n")
 
     if std_auc < 0.05:
-        print("  ✓ Low variance across folds — model is stable, not overfitting.")
+        print("  ✓ Low AUC variance across folds — model is stable.")
     else:
-        print("  ⚠ High variance across folds — possible overfitting or small dataset instability.")
+        print("  ⚠ High AUC variance across folds — performance varies across the study area.")
 
     plot_fold_curves(all_train_aucs, all_val_aucs, out_path=args.out_png)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="K-fold CV for Downy Brome SDM")
+    parser = argparse.ArgumentParser(description="Spatial block CV for Downy Brome SDM")
     parser.add_argument("--shp",       required=True)
     parser.add_argument("--tif",       required=True)
     parser.add_argument("--label_col", default="label")
